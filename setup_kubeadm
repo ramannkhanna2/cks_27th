@@ -1,0 +1,172 @@
+Kubernetes installation steps:
+
+--  disable swap on all machines :
+swapoff -a 
+swapon --show
+
+
+1. Create a script on each machine (vi script.sh) :
+
+#!/bin/bash
+
+# Bootstrap for Kubernetes v1.33 nodes (installs docker, kubeadm/kubelet/kubectl, cri-dockerd)
+
+# Variables - adjust if you want a specific patch
+K8S_MINOR="v1.33"
+K8S_PKG_VERSION="1.33.5-1.1"   # change to 1.33.x-00 for a specific patch
+CRID_VER="0.3.19"             # cri-dockerd release (update if you prefer other)
+
+# Update & prerequisites
+sudo apt update -y
+sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release software-properties-common wget
+
+# Install Docker and enable it
+sudo apt install -y docker.io
+sudo systemctl enable --now docker
+
+# Kernel modules & sysctl required for kubeadm
+sudo modprobe overlay || true
+sudo modprobe br_netfilter || true
+
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sudo sysctl --system
+
+# Add Kubernetes community package repo for v1.33 (pkgs.k8s.io has per-minor repos)
+sudo mkdir -p -m 755 /etc/apt/keyrings
+curl -fsSL "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key" | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+# Update apt and install kube packages pinned to v1.33
+sudo apt-get update
+sudo apt-get install -y kubelet=${K8S_PKG_VERSION} kubeadm=${K8S_PKG_VERSION} kubectl=${K8S_PKG_VERSION}
+
+# Install cri-dockerd (binary tarball) and systemd units
+TMPDIR=$(mktemp -d)
+cd "${TMPDIR}"
+
+CRID_TGZ="cri-dockerd-${CRID_VER}.amd64.tgz"
+CRID_URL="https://github.com/Mirantis/cri-dockerd/releases/download/v${CRID_VER}/${CRID_TGZ}"
+echo "Downloading cri-dockerd from: ${CRID_URL}"
+wget -q --show-progress "${CRID_URL}"
+tar -xvf "${CRID_TGZ}"
+
+# Install the binary
+if [ -f "cri-dockerd/cri-dockerd" ]; then
+  sudo install -o root -g root -m 0755 cri-dockerd/cri-dockerd /usr/local/bin/cri-dockerd
+else
+  echo "ERROR: cri-dockerd binary not found in archive."
+  exit 1
+fi
+
+# Fetch systemd service files for cri-dockerd and patch to use /usr/local/bin
+sudo wget -q -O /etc/systemd/system/cri-docker.service \
+  "https://raw.githubusercontent.com/Mirantis/cri-dockerd/v${CRID_VER}/packaging/systemd/cri-docker.service"
+sudo wget -q -O /etc/systemd/system/cri-docker.socket \
+  "https://raw.githubusercontent.com/Mirantis/cri-dockerd/v${CRID_VER}/packaging/systemd/cri-docker.socket"
+
+sudo sed -i -e 's|/usr/bin/cri-dockerd|/usr/local/bin/cri-dockerd|g' /etc/systemd/system/cri-docker.service || true
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now cri-docker.socket
+sudo systemctl enable cri-docker.service
+sudo systemctl start cri-docker.service || sudo journalctl -u cri-docker.service --no-pager -n 200
+
+# Quick verification output
+echo "---- Installed versions ----"
+kubeadm version -o short || true
+kubelet --version || true
+kubectl version --client --short || true
+docker --version || true
+/usr/local/bin/cri-dockerd --version || true
+
+# Cleanup
+cd /
+rm -rf "${TMPDIR}"
+
+echo "Bootstrap complete. Next: run kubeadm init on control-plane or kubeadm join on worker with --cri-socket unix:///var/run/cri-dockerd.sock"
+
+
+
+
+2. Create a config file on master node (vi config.yaml) :
+
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: 172.31.10.17    # <--- set to your master node Private IP Address
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///var/run/cri-dockerd.sock
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v1.33.5
+networking:
+  podSubnet: 10.10.0.0/16
+
+
+
+3. Initialize the cluster (master node):
+
+sudo kubeadm init --config=config.yaml >> cluster_initialized.txt
+
+
+-- run below commands on master node :
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+
+
+4. Install the calico plugin (master node) :
+
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.30.3/manifests/calico.yaml
+
+
+5. Join the worker node using --cri-socket unix:///var/run/cri-dockerd.sock
+
+kubeadm join 172.31.10.17:6443 --token gcyxo2.39q1rcok765twcwd \
+        --discovery-token-ca-cert-hash sha256:611760ab25a0e2ff84505a2aa6516b312d207a3711ebdeca5e584e3b3ccd39a7 \
+        --cri-socket unix:///var/run/cri-dockerd.sock
+		
+		
+
+
+Key Points :
+
+
+1. In the first step, execute the script using command "sh script.sh"
+
+2. In the second step, replace 'advertiseAddress' with private ip address of Master node and podsubnet CIDR could be of you choice.
+
+3. After 3rd step, make sure to use these commands to configure the config file:
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+You will find them under "cluster_initialized.txt"
+
+4. After 4th step, kubeadm join command with token will also be present in "cluster_initialized.txt".
+
+5. Once cluster is created, use commands like "kubectl get nodes" and "kubect get pods" in your master node to verify.
+
+
+
+
+
+
+
+
+
+
+
+		
+		
+
+		
